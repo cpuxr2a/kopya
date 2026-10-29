@@ -2,11 +2,18 @@ import io
 import json
 import os
 import re
+import sys
 import time
 import urllib.parse
 import urllib.request
-import pypdf
 import streamlit as st
+
+try:
+    import pypdf
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pypdf"])
+    import pypdf
 
 st.set_page_config(
     page_title="Kurye Dağıtım Haritası",
