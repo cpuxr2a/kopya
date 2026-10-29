@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import os
@@ -7,6 +8,7 @@ import time
 import urllib.parse
 import urllib.request
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     import pypdf
@@ -119,6 +121,28 @@ def extract_site_or_street_label(raw_addr: str) -> str:
     return c[:25].strip()
 
 
+def clean_address_description(raw_addr: str) -> str:
+    c = raw_addr
+    c = re.sub(r"^Kabul:\s*", "", c, flags=re.IGNORECASE).strip()
+    c = re.sub(r"(Standart|Ertesi Gün|Aynı Gün|Randevulu)\s+Teslimat\s*$", "", c, flags=re.IGNORECASE).strip()
+    c = re.sub(r"\bTEKİRDAĞ\s+ÇORLU\b", "", c, flags=re.IGNORECASE)
+    c = re.sub(r"\bÇorlu/Tekirdağ\b", "", c, flags=re.IGNORECASE)
+    c = re.sub(r"\bTEKİRDAĞ\b", "", c, flags=re.IGNORECASE)
+
+    mahalle_patterns = [
+        r"\b(?:Önerler|Öneler)\s+(?:mahallesi|mah\w*|mh\.?)\b[,.]?",
+        r"\bTürkgücü\s+(?:Osb\s+)?(?:mahallesi(?:/köyü)?|mah\w*|mh\.?)\b[,.]?",
+        r"\bTürkgücü\s+Mahallesi/Köyü\.\b",
+        r"\b[A-Za-zÇĞİÖŞÜçğıöşü0-9\.\-]+\s+(?:Mahallesi|Mah\.?|Mh\.?)\b[,.]?",
+        r"\b(?:Havuzlar|Zafer|Hatip|Çınarlı)\s+(?:Mahallesi|Mah\.?|Mh\.?)?\b[,.]?",
+    ]
+    for p in mahalle_patterns:
+        c = re.sub(p, "", c, flags=re.IGNORECASE)
+
+    c = re.sub(r"\bÇorlu\b[,.]?", "", c, flags=re.IGNORECASE)
+    return " ".join(c.split()).strip(",.- ")
+
+
 def build_geocoding_query(raw_addr: str) -> str:
     a = raw_addr
     a = re.sub(r"^Kabul:\s*", "", a, flags=re.IGNORECASE).strip()
@@ -187,13 +211,13 @@ def resolve_coordinates(raw_addr: str):
 # -------------------------------------------------------------
 # WEB ARAYÜZÜ (STREAMLIT)
 # -------------------------------------------------------------
-st.title("🚚 Kurye Dağıtım Haritası")
-st.write("DistHub PDF dosyasını yükleyin, otomatik olarak Yandex Harita bağlantısını alın.")
+st.title("🚚 Çorlu Kurye Dağıtım Haritası")
+st.write("DistHub PDF dosyasını yükleyin, haritayı canlı görün veya Yandex'te açın.")
 
-uploaded_file = st.file_uploader("PDF Dosyasını Seçin", type=["pdf"])
+uploaded_file = st.file_uploader("DistHub PDF Dosyasını Yükleyin", type=["pdf"])
 
 if uploaded_file is not None:
-    with st.spinner("PDF okunuyor ve teslimat noktaları ayıklanıyor..."):
+    with st.spinner("PDF okunuyor ve paketler ayıklanıyor..."):
         reader = pypdf.PdfReader(uploaded_file)
         raw_items = []
         for pno, page in enumerate(reader.pages, start=1):
@@ -214,9 +238,9 @@ if uploaded_file is not None:
         raw_items.sort(key=lambda x: x[0])
 
     if not raw_items:
-        st.error("PDF içinde geçerli teslimat kaydı bulunamadı!")
+        st.error("PDF içinde teslimat adresi bulunamadı!")
     else:
-        st.success(f"Toplam {len(raw_items)} paket başarıyla okundu!")
+        st.success(f"Toplam {len(raw_items)} teslimat paketi okundu!")
 
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -225,16 +249,18 @@ if uploaded_file is not None:
         total = len(raw_items)
         for idx, (sira, raw_addr) in enumerate(raw_items):
             title = extract_site_or_street_label(raw_addr)
+            desc = clean_address_description(raw_addr)
+
             if title not in grouped:
-                status_text.text(f"Haritada aranıyor: {title}")
+                status_text.text(f"Adres bulunuyor: {title}")
                 lat, lon = resolve_coordinates(raw_addr)
                 grouped[title] = {
                     "title": title,
                     "lat": lat,
                     "lon": lon,
-                    "count": 0,
+                    "items": []
                 }
-            grouped[title]["count"] += 1
+            grouped[title]["items"].append(desc)
             progress_bar.progress((idx + 1) / total)
 
         status_text.empty()
@@ -242,22 +268,119 @@ if uploaded_file is not None:
 
         valid = [d for d in grouped.values() if d["lat"]]
 
+        # 1. YANDEX URL
         pts = []
         for i, m in enumerate(valid, 1):
             pts.append(f"{m['lon']:.6f},{m['lat']:.6f},pm2rdm{i}")
         yandex_url = "https://yandex.com.tr/maps/?pt=" + "~".join(pts) + "&z=12"
 
-        st.subheader("🎉 Haritanız Hazır!")
-        st.write(f"**{len(valid)} Durak** ({len(raw_items)} Paket) tekil başlıklarda toplandı.")
+        # 2. CANLI İNTERAKTİF HARİTA (Tıklanabilir pinler + Navigasyon)
+        center_lat = sum(m["lat"] for m in valid) / len(valid) if valid else 41.154
+        center_lon = sum(m["lon"] for m in valid) / len(valid) if valid else 27.875
 
-        st.link_button(
-            "👉 YANDEX HARİTALAR'DA AÇ",
-            yandex_url,
-            type="primary",
-            use_container_width=True
-        )
+        markers_data = []
+        for i, m in enumerate(valid, 1):
+            cnt = len(m["items"])
+            desc_html = f"<b>{cnt} Paket Bulunuyor</b><br>" + "<br>".join(f"• {x}" for x in m["items"])
+            markers_data.append({
+                "no": i,
+                "title": m["title"],
+                "count": cnt,
+                "desc": desc_html,
+                "lat": m["lat"],
+                "lon": m["lon"]
+            })
 
-        with st.expander("Durak Listesini Gör"):
-            for m in valid:
-                st.write(f"- **{m['title']}** ({m['count']} Paket)")
+        leaflet_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+            <style>
+                #map {{ width: 100%; height: 500px; border-radius: 12px; }}
+                .badge {{
+                    background: #2563eb; color: white; border-radius: 50%;
+                    width: 26px; height: 26px; display: flex; align-items: center;
+                    justify-content: center; font-size: 11px; font-weight: bold;
+                    border: 2px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+                }}
+                .badge.multi {{ background: #ef4444; width: 30px; height: 30px; font-size: 13px; }}
+                .popup-title {{ font-size: 14px; font-weight: bold; color: #1e293b; margin-bottom: 4px; }}
+                .popup-desc {{ font-size: 12px; color: #475569; line-height: 1.4; }}
+                .nav-btn {{
+                    display: inline-block; margin-top: 8px; padding: 6px 12px;
+                    background: #2563eb; color: white; text-decoration: none;
+                    border-radius: 4px; font-size: 12px; font-weight: 500;
+                }}
+            </style>
+        </head>
+        <body style="margin:0;padding:0;">
+            <div id="map"></div>
+            <script>
+                const markers = {json.dumps(markers_data, ensure_ascii=False)};
+                const map = L.map('map').setView([{center_lat:.5f}, {center_lon:.5f}], 13);
+                L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                    maxZoom: 19
+                }}).addTo(map);
 
+                const bounds = [];
+                markers.forEach(m => {{
+                    const icon = L.divIcon({{
+                        className: 'custom-icon',
+                        html: `<div class="badge ${{m.count > 1 ? 'multi' : ''}}">${{m.no}}</div>`,
+                        iconSize: [28, 28],
+                        iconAnchor: [14, 14]
+                    }});
+                    const popupContent = `
+                        <div class="popup-title">${{m.title}}</div>
+                        <div class="popup-desc">${{m.desc}}</div>
+                        <a class="nav-btn" href="yandexnavi://build_route_on_map?lat_to=${{m.lat}}&lon_to=${{m.lon}}" target="_blank">Yandex Navigasyon</a>
+                        <a class="nav-btn" style="background:#059669;margin-left:4px;" href="https://www.google.com/maps/dir/?api=1&destination=${{m.lat}},${{m.lon}}" target="_blank">Google Maps</a>
+                    `;
+                    L.marker([m.lat, m.lon], {{icon: icon}}).bindPopup(popupContent).addTo(map);
+                    bounds.push([m.lat, m.lon]);
+                }});
+                if (bounds.length > 0) {{
+                    map.fitBounds(bounds, {{padding: [30, 30]}});
+                }}
+            </script>
+        </body>
+        </html>
+        """
+
+        st.subheader(f"📍 Canlı Harita ({len(valid)} Durak / {len(raw_items)} Paket)")
+        st.caption("Aşağıdaki pinlere dokunarak sitenin adını, daire detaylarını ve Yandex Navigasyon butonunu görebilirsiniz:")
+        components.html(leaflet_html, height=520)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.link_button("🌐 Yandex Haritalar'da Aç", yandex_url, type="primary", use_container_width=True)
+
+        # 3. CSV İndirme Butonu (Yandex Harita Oluşturucu'da Düzenleme / Taşıma Yapmak İsteyenler İçin)
+        csv_buffer = io.StringIO()
+        csv_writer = csv.writer(csv_buffer, delimiter=";")
+        csv_writer.writerow(["Enlem", "Boylam", "İsim", "Açıklama"])
+        for m in valid:
+            cnt = len(m["items"])
+            desc_str = f"[{cnt} Paket] " + " // ".join(m["items"]) if cnt > 1 else m["items"][0]
+            csv_writer.writerow([f"{m['lat']:.6f}", f"{m['lon']:.6f}", m["title"], desc_str])
+
+        with col2:
+            st.download_button(
+                label="📥 Yandex Düzenleme Dosyası (CSV)",
+                data=csv_buffer.getvalue().encode("utf-8-sig"),
+                file_name="disthub_yandex.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="Yandex Harita Oluşturucu'ya yükleyerek noktaların yerini fareyle sürükleyip değiştirebilirsiniz."
+            )
+
+        with st.expander("ℹ️ Noktaları Sürükleyip Yerini Değiştirmek Mi İstiyorsunuz?"):
+            st.write("""
+            1. Yukarıdaki **'Yandex Düzenleme Dosyası (CSV)'** butonuna basarak dosyayı indirin.
+            2. [Yandex Harita Oluşturucu](https://yandex.com.tr/map-constructor) sitesini açın.
+            3. **'İçe Aktar'** butonuna basıp indirdiğiniz CSV dosyasını seçin.
+            4. Artık tüm noktaları fareyle/parmağınızla tutup haritada istediğiniz sokağa sürükleyebilir, adını değiştirebilirsiniz!
+            """)
